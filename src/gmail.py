@@ -34,18 +34,19 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
-def get_latest_email(service):
+def get_unread_emails(service, max_results=10):
+    """Return unread messages in the Inbox (message IDs and thread IDs)."""
     results = service.users().messages().list(
         userId="me",
-        maxResults=1,
+        q="in:inbox is:unread",
+        maxResults=max_results,
     ).execute()
 
-    messages = results.get("messages", [])
-    if not messages:
-        print("No emails found.")
-        return None
+    return results.get("messages", [])
 
-    message_id = messages[0]["id"]
+
+def get_email_by_id(service, message_id):
+    """Fetch one full Gmail message by its ID."""
     return service.users().messages().get(
         userId="me",
         id=message_id,
@@ -58,13 +59,15 @@ def get_email_body(message):
 
     if payload.get("body", {}).get("data"):
         data = payload["body"]["data"]
-        return base64.urlsafe_b64decode(data).decode("utf-8")
+        return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
 
     for part in payload.get("parts", []):
         if part.get("mimeType") == "text/plain":
             body_data = part.get("body", {}).get("data")
             if body_data:
-                return base64.urlsafe_b64decode(body_data).decode("utf-8")
+                return base64.urlsafe_b64decode(body_data).decode(
+                    "utf-8", errors="replace"
+                )
 
     return "No readable email body found."
 
