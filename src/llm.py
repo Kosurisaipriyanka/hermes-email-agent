@@ -11,4 +11,10 @@ def get_llm():
     if not api_key:
         raise ValueError("GROQ_API_KEY is missing from .env")
 
-    return Groq(api_key=api_key)
+    # Bound request time and SDK retries so one slow API call cannot stall
+    # the continuous monitoring loop for too long.
+    return Groq(
+        api_key=api_key,
+        timeout=30.0,
+        max_retries=1,
+    )
