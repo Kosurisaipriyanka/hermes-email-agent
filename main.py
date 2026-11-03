@@ -1,8 +1,12 @@
 import json
+import time
+import traceback
+from email.utils import parseaddr
 
 from src.gmail import (
     get_gmail_service,
-    get_latest_email,
+    get_unread_emails,
+    get_email_by_id,
     get_email_body,
     send_email,
 )
@@ -13,32 +17,29 @@ from src.reply import generate_reply
 from src.approval import get_human_approval
 
 
-def main():
-    print("Connecting to Gmail...")
-    service = get_gmail_service()
-    print("Gmail connected successfully!")
+POLL_INTERVAL_SECONDS = 30
+MAX_RESULTS_PER_CHECK = 10
 
-    email = get_latest_email(service)
-    if not email:
-        return
 
-    headers = email["payload"]["headers"]
-    sender = ""
-    subject = ""
+def process_email(service, client, message_id):
+    """Run the existing Hermes analysis and approval workflow for one message."""
+    email = get_email_by_id(service, message_id)
+    headers = email.get("payload", {}).get("headers", [])
 
-    for header in headers:
-        if header["name"] == "From":
-            sender = header["value"]
-        elif header["name"] == "Subject":
-            subject = header["value"]
-
+    header_values = {
+        header.get("name", "").lower(): header.get("value", "")
+        for header in headers
+    }
+    sender_header = header_values.get("from", "")
+    sender_email = parseaddr(sender_header)[1] or sender_header
+    subject = header_values.get("subject", "(No subject)")
     body = get_email_body(email)
 
-    print("\nEmail received!")
-    print("From:", sender)
+    print("\n" + "=" * 60)
+    print("New unread email received!")
+    print("From:", sender_header)
     print("Subject:", subject)
-
-    client = get_llm()
+    print("=" * 60)
 
     prompt = f"""
 You are Hermes, an email classification agent.
@@ -67,7 +68,7 @@ Rules:
 - Return only the requested JSON structure.
 
 Email:
-From: {sender}
+From: {sender_header}
 Subject: {subject}
 Body: {body}
 """
@@ -115,8 +116,7 @@ Body: {body}
         messages=[{"role": "user", "content": prompt}],
     )
 
-    llm_output = response.choices[0].message.content
-    analysis = json.loads(llm_output)
+    analysis = json.loads(response.choices[0].message.content)
 
     print("\n===== HERMES ANALYSIS =====")
     print("Category:", analysis["category"])
@@ -129,14 +129,14 @@ Body: {body}
     print("Decision:", decision)
 
     if analysis["action_required"]:
-        draft = generate_reply(client, sender, subject, body)
+        draft = generate_reply(client, sender_header, subject, body)
         approved = get_human_approval(draft)
 
         if approved:
             print("\nReply approved by human.")
             send_result = send_email(
                 service,
-                sender,
+                sender_email,
                 f"Re: {subject}",
                 draft,
             )
@@ -146,6 +146,64 @@ Body: {body}
             print("\nReply rejected by human.")
     else:
         print("\nNo reply is required.")
+
+    # Mark the message as read only after processing completes.
+    # This prevents it from being analysed again on the next poll.
+    service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"removeLabelIds": ["UNREAD"]},
+    ).execute()
+    print("Email marked as read.")
+
+
+def main():
+    print("Starting Hermes continuous email monitoring...")
+    print(f"Checking unread Inbox emails every {POLL_INTERVAL_SECONDS} seconds.")
+    print("Press Ctrl+C to stop Hermes.\n")
+
+    service = get_gmail_service()
+    print("Gmail connected successfully!")
+
+    client = get_llm()
+    processed_this_run = set()
+
+    try:
+        while True:
+            try:
+                messages = get_unread_emails(
+                    service,
+                    max_results=MAX_RESULTS_PER_CHECK,
+                )
+
+                pending = [
+                    message for message in messages
+                    if message["id"] not in processed_this_run
+                ]
+
+                if not pending:
+                    print("No new unread emails. Checking again soon...")
+                else:
+                    print(f"Found {len(pending)} unread email(s).")
+
+                for message in pending:
+                    message_id = message["id"]
+                    try:
+                        process_email(service, client, message_id)
+                        processed_this_run.add(message_id)
+                    except Exception as exc:
+                        print(f"Error processing email {message_id}: {exc}")
+                        traceback.print_exc()
+                        # Leave it unread so it can be retried on a later poll.
+
+            except Exception as exc:
+                print(f"Error while checking Gmail: {exc}")
+                traceback.print_exc()
+
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    except KeyboardInterrupt:
+        print("\nHermes stopped by user.")
 
 
 if __name__ == "__main__":
